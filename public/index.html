@@ -1,0 +1,111 @@
+<!doctype html>
+<!--
+  Audio-Jackhammer
+  Copyright (c) 2026 Lewis James Seals Jr. All rights reserved.
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+  PARTICULAR PURPOSE AND NONINFRINGEMENT.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio Jackhammer — construction-site audio denoiser</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f6f6f4; --fg:#1d1f21; --card:#fff; --line:#d8d8d2; --accent:#d9480f; --muted:#666; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#17191b; --fg:#ececec; --card:#202326; --line:#33373b; --muted:#9a9a9a; } }
+  body { margin:0; font:16px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width:640px; margin:0 auto; padding:2rem 1rem; }
+  h1 { margin:0 0 .25rem; font-size:1.6rem; }
+  p.sub { margin:0 0 1.5rem; color:var(--muted); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:1.25rem; }
+  label { display:block; margin:.9rem 0 .25rem; font-weight:600; }
+  input[type=file], input[type=range], select { width:100%; }
+  button { margin-top:1.1rem; padding:.7rem 1.2rem; border:0; border-radius:8px; background:var(--accent); color:#fff; font-size:1rem; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  #status { margin-top:1rem; min-height:1.5em; color:var(--muted); }
+  #status.err { color:#e03131; }
+  audio { width:100%; margin-top:.75rem; }
+  a.dl { display:inline-block; margin-top:.5rem; color:var(--accent); }
+  small { color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Audio Jackhammer</h1>
+  <p class="sub">Speech / environmental denoising tuned for construction-site noise. Enhancement, not active noise cancellation.</p>
+  <div class="card">
+    <label for="file">Audio file (WAV, MP3, M4A, OGG, FLAC — whatever your browser can decode)</label>
+    <input id="file" type="file" accept="audio/*">
+    <label for="reduce">Noise reduction: <span id="reduceVal">18</span> dB</label>
+    <input id="reduce" type="range" min="6" max="40" value="18">
+    <label for="hp">High-pass</label>
+    <select id="hp"><option value="90" selected>90 Hz (default)</option><option value="120">120 Hz</option><option value="80">80 Hz</option><option value="0">Off</option></select>
+    <button id="go" disabled>Denoise</button>
+    <div id="status"></div>
+    <audio id="player" controls hidden></audio>
+    <a id="dl" class="dl" hidden download="denoised.wav">Download denoised WAV</a>
+    <p><small>Clips up to about 45 seconds (Vercel's 4.5 MB request limit). Audio is processed in memory and not stored.</small></p>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const MAX_BYTES = 4.4 * 1024 * 1024;
+let current = null;
+$("reduce").oninput = () => ($("reduceVal").textContent = $("reduce").value);
+$("file").onchange = () => { $("go").disabled = !$("file").files.length; setStatus(""); };
+
+function setStatus(msg, err = false) { $("status").textContent = msg; $("status").className = err ? "err" : ""; }
+
+function encodeWav16(f32, rate) {
+  const buf = new ArrayBuffer(44 + f32.length * 2), v = new DataView(buf);
+  const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); v.setUint32(4, 36 + f32.length * 2, true); w(8, "WAVE"); w(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, "data"); v.setUint32(40, f32.length * 2, true);
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    v.setInt16(44 + i * 2, s < 0 ? s * 32768 : s * 32767, true);
+  }
+  return buf;
+}
+
+async function toMono48k(file) {
+  const raw = await file.arrayBuffer();
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  let decoded;
+  try { decoded = await ctx.decodeAudioData(raw); }
+  catch { throw new Error("Your browser could not decode that file. Try WAV or MP3."); }
+  finally { ctx.close(); }
+  const frames = Math.ceil(decoded.duration * 48000);
+  const off = new OfflineAudioContext(1, frames, 48000); // mixes down to mono and resamples
+  const src = off.createBufferSource();
+  src.buffer = decoded; src.connect(off.destination); src.start();
+  return (await off.startRendering()).getChannelData(0);
+}
+
+$("go").onclick = async () => {
+  const file = $("file").files[0];
+  $("go").disabled = true; $("player").hidden = true; $("dl").hidden = true;
+  try {
+    setStatus("Decoding…");
+    const mono = await toMono48k(file);
+    const wav = encodeWav16(mono, 48000);
+    if (wav.byteLength > MAX_BYTES) throw new Error(`Clip is ${(mono.length / 48000).toFixed(0)} s; the limit is about 45 s. Please trim it first.`);
+    setStatus("Denoising…");
+    const qs = new URLSearchParams({ model: "spectral", reduceDb: $("reduce").value, highpass: $("hp").value });
+    const res = await fetch(`/api/denoise?${qs}`, { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: wav });
+    if (!res.ok) { let m = res.statusText; try { m = (await res.json()).error; } catch {} throw new Error(m); }
+    const blob = await res.blob();
+    if (current) URL.revokeObjectURL(current);
+    current = URL.createObjectURL(blob);
+    $("player").src = current; $("player").hidden = false;
+    $("dl").href = current; $("dl").hidden = false;
+    setStatus(`Done. ${res.headers.get("X-Denoiser-Audio-Seconds")} s processed (RTF ${res.headers.get("X-Denoiser-RTF")}).`);
+  } catch (e) { setStatus(e.message, true); }
+  finally { $("go").disabled = false; }
+};
+</script>
+</body>
+</html>

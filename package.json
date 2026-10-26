@@ -1,0 +1,12 @@
+{
+  "name": "audio-jackhammer",
+  "version": "1.0.0",
+  "description": "Environmental denoiser for construction-site audio, adapted for Vercel (pure JavaScript, zero dependencies).",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test test/dsp.test.js",
+    "denoise": "node bin/denoise.mjs"
+  }
+}
